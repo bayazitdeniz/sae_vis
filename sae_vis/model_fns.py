@@ -13,132 +13,148 @@ import einops
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
-@dataclass
-class CrossCoderConfig:
-    """Class for storing configuration parameters for the CrossCoder"""
-
-    d_in: int
-    d_hidden: int | None = None
-    dict_mult: int | None = None
-
-    l1_coeff: float = 3e-4
-
-    apply_b_dec_to_input: bool = False
-
-    def __post_init__(self):
-        assert (
-            int(self.d_hidden is None) + int(self.dict_mult is None) == 1
-        ), "Exactly one of d_hidden or dict_mult must be provided"
-        if (self.d_hidden is None) and isinstance(self.dict_mult, int):
-            self.d_hidden = self.d_in * self.dict_mult
-        elif (self.dict_mult is None) and isinstance(self.d_hidden, int):
-            #assert self.d_hidden % self.d_in == 0, "d_hidden must be a multiple of d_in"
-            self.dict_mult = self.d_hidden // self.d_in
-
 
 class CrossCoder(nn.Module):
-    def __init__(self, cfg: CrossCoderConfig):
+    def __init__(self, cfg, is_btopk=False):
         super().__init__()
         self.cfg = cfg
-
-        assert isinstance(cfg.d_hidden, int)
-
-        # W_enc has shape (d_in, d_encoder), where d_encoder is a multiple of d_in (cause dictionary learning; overcomplete basis)
+        d_hidden = self.cfg["dict_size"]
+        d_in = self.cfg["d_in"]
+        n_models = 2 # default is to have at least 2 models
+        if "n_models" in self.cfg.keys():
+            n_models = self.cfg["n_models"]
+        self.dtype = DTYPES[self.cfg["enc_dtype"]]
+        torch.manual_seed(self.cfg["seed"])
         self.W_enc = nn.Parameter(
-            torch.nn.init.kaiming_uniform_(torch.empty(2, cfg.d_in, cfg.d_hidden))
+            torch.empty(n_models, d_in, d_hidden, dtype=self.dtype)
         )
         self.W_dec = nn.Parameter(
-            torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_hidden, 2, cfg.d_in))
+            torch.nn.init.normal_(
+                torch.empty(
+                    d_hidden, n_models, d_in, dtype=self.dtype
+                )
+            )
         )
-        self.b_enc = nn.Parameter(torch.zeros(cfg.d_hidden))
-        self.b_dec = nn.Parameter(torch.zeros(2, cfg.d_in))
-        self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+        # Make norm of W_dec 0.1 for each column, separate per layer
+        self.W_dec.data = (
+            self.W_dec.data / self.W_dec.data.norm(dim=-1, keepdim=True) * self.cfg["dec_init_norm"]
+        )
+        # Initialise W_enc to be the transpose of W_dec
+        self.W_enc.data = einops.rearrange(
+            self.W_dec.data.clone(),
+            "d_hidden n_models d_model -> n_models d_model d_hidden",
+        )
+        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=self.dtype))
+        self.b_dec = nn.Parameter(
+            torch.zeros((n_models, d_in), dtype=self.dtype)
+        )
+        self.d_hidden = d_hidden
 
-    def forward(self, x: torch.Tensor):
-        # TODO: lots of this stuff is legacy SAE stuff that probably is wrong / unnecessary
-        x_cent = x - self.b_dec * self.cfg.apply_b_dec_to_input
+        self.to(self.cfg["device"])
+        self.save_dir = None
+        self.save_version = 0
+        
+        self.is_btopk = is_btopk
+        if is_btopk:
+            self.register_buffer("k", torch.tensor(cfg["batch_topk_init"], dtype=torch.int))
+            threshold = -1.0
+            self.register_buffer("threshold", torch.tensor(threshold, dtype=torch.float32))
+
+    def encode(self, x, apply_relu=True):
+        # x: [batch, n_models, d_model]
         x_enc = einops.einsum(
-            x_cent,
+            x,
             self.W_enc,
-            "... n_layers d_model, n_layers d_model d_hidden -> ... d_hidden",
+            "batch n_models d_model, n_models d_model d_hidden -> batch d_hidden",
         )
-        acts = F.relu(x_enc + self.b_enc)
-        #x_reconstruct = acts @ self.W_dec + self.b_dec
-        x_reconstruct = einops.einsum(
+        if apply_relu:
+            f = F.relu(x_enc + self.b_enc)
+        else:
+            f = x_enc + self.b_enc
+        
+        if self.is_btopk:
+            post_relu_f = f
+            code_normalization = self.W_dec.norm(dim=2).sum(dim=1).unsqueeze(0)
+            post_relu_f_scaled = post_relu_f * code_normalization
+            f = post_relu_f * (post_relu_f_scaled > self.threshold)
+        
+        return f
+
+    def decode(self, acts):
+        # acts: [batch, d_hidden]
+        acts_dec = einops.einsum(
             acts,
             self.W_dec,
-            "... d_hidden, d_hidden n_layers d_model -> ... n_layers d_model",
+            "batch d_hidden, d_hidden n_models d_model -> batch n_models d_model",
         )
-        diff = x_reconstruct.float() - x.float()
-        squared_diff = diff.pow(2)
-        l2_per_batch = einops.reduce(squared_diff, 'batch n_layers d_model -> batch', 'sum')
-        l2_loss = l2_per_batch.mean()
-        #l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-        decoder_norms = self.W_dec.norm(dim=-1)
-        # decoder_norms: [d_hidden, n_layers]
-        total_decoder_norm = einops.reduce(decoder_norms, 'd_hidden n_layers -> d_hidden', 'sum')
-        l1_loss = (acts * total_decoder_norm[None, :]).sum(-1).mean(0)
-        loss = l2_loss + l1_loss
-        return loss, x_reconstruct, acts, l2_loss, l1_loss
+        return acts_dec + self.b_dec
 
-    @torch.no_grad()
-    def remove_parallel_component_of_grads(self):
-        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
-        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(
-            -1, keepdim=True
-        ) * W_dec_normed
-        self.W_dec.grad -= W_dec_grad_proj
+    def forward(self, x):
+        # x: [batch, n_models, d_model]
+        acts = self.encode(x)
+        return self.decode(acts)
+    
+    @classmethod
+    def load(cls, version_dir, checkpoint_version, path="./workspace/crosscoder-pythia/checkpoints", verbose=True):
+        # TODO: fix base dir naming to be model agnostic
+        #       for now keep it this way because 
+        #       the path is hardcoded in the analysis
+        save_dir = Path(path) / str(version_dir)
+        cfg_path = save_dir / f"{str(checkpoint_version)}_cfg.json"
+        weight_path = save_dir / f"{str(checkpoint_version)}.pt"
 
-    def __repr__(self) -> str:
-        return f"CrossCoder(d_in={self.cfg.d_in}, dict_mult={self.cfg.dict_mult})"
-
+        cfg = json.load(open(cfg_path, "r"))
+        if verbose:
+            pprint.pprint(cfg)
+        self = cls(cfg=cfg)
+        self.load_state_dict(torch.load(weight_path))
+        return self
 
 # # ==============================================================
 # # ! TRANSFORMERS
 # # This returns the activations & resid_pre as well (optionally)
 # # ==============================================================
 
-
+from nnsight import LanguageModel
 class TransformerLensWrapper(nn.Module):
     """
     This class wraps around & extends the TransformerLens model, so that we can make sure things like the forward
     function have a standardized signature.
     """
 
-    def __init__(self, model: HookedTransformer, hook_point: str):
+    def __init__(self, model: LanguageModel, cfg):
         super().__init__()
-        assert (
-            hook_point in model.hook_dict
-        ), f"Error: hook_point={hook_point!r} must be in model.hook_dict"
         self.model = model
-        self.hook_point = hook_point
-
-        # Get the layer (so we can do the early stopping in our forward pass)
-        layer_match = re.match(r"blocks\.(\d+)\.", hook_point)
-        assert layer_match, f"Error: expecting hook_point to be 'blocks.{{layer}}.{{...}}', but got {hook_point!r}"
-        self.hook_layer = int(layer_match.group(1))
-
-        # Get the hook names for the residual stream (final) and residual stream (immediately after hook_point)
-        self.hook_point_resid = utils.get_act_name("resid_post", self.hook_layer)
-        self.hook_point_resid_final = utils.get_act_name(
-            "resid_post", self.model.cfg.n_layers - 1
-        )
-        assert self.hook_point_resid in model.hook_dict
-        assert self.hook_point_resid_final in model.hook_dict
+        self.cfg = cfg
+        self.hook_point = "resid"
+        LAYER = int(self.cfg.hook_point.split(".")[1]) - 1
+        model_config = model.config
+        model_name_lowered = model_config._name_or_path.lower()
+        if hasattr(model_config, "_name_or_path"):
+            if "pythia" in model_name_lowered:
+                self.submodule = model.gpt_neox.layers[LAYER]
+            elif "olmo" in model_name_lowered:
+                self.submodule = model.model.layers[LAYER]
+            elif "bloom" in model_name_lowered:
+                self.submodule = model.transformer.h[LAYER]
+            else:
+                raise NotImplementedError("Model name not supported yet.")
+        else:
+            raise ValueError("Model config is missing _name_or_path entry.")
 
     @overload
     def forward(
         self,
         tokens: Tensor,
         return_logits: Literal[True],
-    ) -> tuple[Tensor, Tensor, Tensor]: ...
+    ) -> Tensor: ...
 
     @overload
     def forward(
         self,
         tokens: Tensor,
         return_logits: Literal[False],
-    ) -> tuple[Tensor, Tensor]: ...
+    ) -> Tensor: ...
 
     def forward(
         self,
@@ -153,30 +169,37 @@ class TransformerLensWrapper(nn.Module):
                 If True, returns (logits, residual, activation)
                 If False, returns (residual, activation)
         """
-
-        # Run with hook functions to store the activations & final value of residual stream
+        # Store the activations & final value of residual stream
         # If return_logits is False, then we compute the last residual stream value but not the logits
-        output: Tensor = self.model.run_with_hooks(
-            tokens,
-            # stop_at_layer = (None if return_logits else self.hook_layer),
-            fwd_hooks=[
-                (self.hook_point, self.hook_fn_store_act),
-                (self.hook_point_resid_final, self.hook_fn_store_act),
-            ],
-        )
+        
+        with self.model.trace(tokens, **{'scan' : False, 'validate' : False}): #, invoker_args={}): 
+            hidden_states = self.submodule.output.save()
+            
+            # Capture hidden states (activations)
+            hidden_states = self.submodule.output.save()
+            curr_input = self.model.inputs.save()
+            if "pythia" in self.model.config._name_or_path.lower():
+                resid_pre = self.model.gpt_neox.layers[-1].output[0].save()
+            elif "olmo" in self.model.config._name_or_path.lower():
+                resid_pre = self.model.model.layers[-1].output[0].save()
+            elif "bloom" in self.model.config._name_or_path.lower():
+                resid_pre = self.model.transformer.h[-1].output[0].save()
+            else:
+                raise NotImplementedError("Model name not supported yet.")
+
+            # Stop capturing after saving
+            self.submodule.output.stop()
+       
+        attn_mask = curr_input.value[1]["attention_mask"]
+        hidden_states = hidden_states.value
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        hidden_states = hidden_states[attn_mask != 0]
+        hidden_states = hidden_states.view(tokens.shape[0], tokens.shape[1], hidden_states.shape[-1])
 
         # The hook functions work by storing data in model's hook context, so we pop them back out
-        activation: Tensor = self.model.hook_dict[self.hook_point].ctx.pop("activation")
-        if self.hook_point_resid_final == self.hook_point:
-            residual: Tensor = activation
-        else:
-            residual: Tensor = self.model.hook_dict[
-                self.hook_point_resid_final
-            ].ctx.pop("activation")
-
-        if return_logits:
-            return output, residual, activation
-        return residual, activation
+        activation: Tensor = hidden_states
+        return resid_pre, activation
 
     def hook_fn_store_act(self, activation: torch.Tensor, hook: HookPoint):
         hook.ctx["activation"] = activation
@@ -187,7 +210,11 @@ class TransformerLensWrapper(nn.Module):
 
     @property
     def W_U(self):
-        return self.model.W_U
+        # return self.model.W_U
+        if hasattr(self.model, "embed_out"):
+            return self.model.embed_out.weight.T
+        else:
+            return self.model.lm_head.weight.T
 
     @property
     def W_out(self):

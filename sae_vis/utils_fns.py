@@ -148,42 +148,42 @@ def random_range_indices(
 # The verion using `tokenizer.decode` is much slower, but Stefan's raised issues about it not working correctly for e.g.
 # Cyrillic characters. I think patching the `vocab_dict` in some way is the best solution.
 
-# def get_decode_html_safe_fn(tokenizer, html: bool = False) -> Callable[[int | list[int]], str | list[str]]:
-#     '''
-#     Creates a tokenization function on single integer token IDs, which is HTML-friendly.
-#     '''
-#     def decode(token_id: int | list[int]) -> str | list[str]:
-#         '''
-#         Check this is a single token
-#         '''
-#         if isinstance(token_id, int):
-#             str_tok = tokenizer.decode(token_id)
-#             return process_str_tok(str_tok, html=html)
-#         else:
-#             str_toks = tokenizer.batch_decode(token_id)
-#             return [process_str_tok(str_tok, html=html) for str_tok in str_toks]
-
-#     return decode
-
-
-def get_decode_html_safe_fn(
-    tokenizer: PreTrainedTokenizerBase, html: bool = False
-) -> Callable[[int | list[int]], str | list[str]]:
-    vocab_dict = {v: k for k, v in tokenizer.vocab.items()}  # type: ignore
-
+def get_decode_html_safe_fn(tokenizer, html: bool = False) -> Callable[[int | list[int]], str | list[str]]:
+    '''
+    Creates a tokenization function on single integer token IDs, which is HTML-friendly.
+    '''
     def decode(token_id: int | list[int]) -> str | list[str]:
-        """
+        '''
         Check this is a single token
-        """
+        '''
         if isinstance(token_id, int):
-            str_tok = vocab_dict.get(token_id, "UNK")
+            str_tok = tokenizer.decode(token_id)
             return process_str_tok(str_tok, html=html)
         else:
-            if isinstance(token_id, torch.Tensor):
-                token_id = token_id.tolist()
-            return [decode(tok) for tok in token_id]  # type: ignore
+            str_toks = tokenizer.batch_decode(token_id)
+            return [process_str_tok(str_tok, html=html) for str_tok in str_toks]
 
     return decode
+
+
+# def get_decode_html_safe_fn(
+#     tokenizer: PreTrainedTokenizerBase, html: bool = False
+# ) -> Callable[[int | list[int]], str | list[str]]:
+#     vocab_dict = {v: k for k, v in tokenizer.vocab.items()}  # type: ignore
+
+#     def decode(token_id: int | list[int]) -> str | list[str]:
+#         """
+#         Check this is a single token
+#         """
+#         if isinstance(token_id, int):
+#             str_tok = vocab_dict.get(token_id, "UNK")
+#             return process_str_tok(str_tok, html=html)
+#         else:
+#             if isinstance(token_id, torch.Tensor):
+#                 token_id = token_id.tolist()
+#             return [decode(tok) for tok in token_id]  # type: ignore
+
+#     return decode
 
 
 # # Code to test this function:

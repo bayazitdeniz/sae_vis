@@ -3,7 +3,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, List
 
 import numpy as np
 from dataclasses_json import dataclass_json
@@ -30,8 +30,7 @@ from sae_vis.html_fns import (
     uColorMap,
 )
 from sae_vis.model_fns import (
-    CrossCoder,
-    CrossCoderConfig,
+    CrossCoder
 )
 from sae_vis.utils_fns import (
     FeatureStatistics,
@@ -41,6 +40,7 @@ from sae_vis.utils_fns import (
     to_str_tokens,
     unprocess_str_tok,
 )
+from nnsight import LanguageModel
 
 METRIC_TITLES = {
     "act_size": "Activation Size",
@@ -1089,8 +1089,7 @@ class SaeVisData:
     feature_stats: FeatureStatistics = field(default_factory=FeatureStatistics)
     cfg: SaeVisConfig = field(default_factory=SaeVisConfig)
 
-    model_A: HookedTransformer | None = None
-    model_B: HookedTransformer | None = None
+    model_list: List[LanguageModel] | None = None
     encoder: CrossCoder | None = None
     encoder_B: CrossCoder | None = None
 
@@ -1108,10 +1107,10 @@ class SaeVisData:
     @classmethod
     def create(
         cls,
-        encoder: nn.Module,
-        model_A: HookedTransformer,
-        model_B: HookedTransformer,
+        encoder: CrossCoder,
+        model_list: List[LanguageModel],
         tokens: Int[Tensor, "batch seq"],
+        attn: Int[Tensor, "batch seq"],
         cfg: SaeVisConfig,
         encoder_B: CrossCoder | None = None,
     ) -> "SaeVisData":
@@ -1134,15 +1133,14 @@ class SaeVisData:
 
         sae_vis_data = get_feature_data(
             encoder=encoder_wrapper,
-            model_A=model_A,
-            model_B=model_B,
+            model_list=model_list,
             tokens=tokens,
+            attn=attn,
             cfg=cfg,
             encoder_B=encoder_B,
         )
         sae_vis_data.cfg = cfg
-        sae_vis_data.model_A = model_A
-        sae_vis_data.model_B = model_B
+        sae_vis_data.model_list = model_list
         sae_vis_data.encoder = encoder_wrapper
         sae_vis_data.encoder_B = encoder_B
 
@@ -1173,9 +1171,9 @@ class SaeVisData:
         )
 
         # Get tokenize function (we only need to define it once)
-        assert self.model_A is not None
-        assert self.model_A.tokenizer is not None
-        decode_fn = get_decode_html_safe_fn(self.model_A.tokenizer)
+        assert self.model_list is not None
+        assert self.model_list[0].tokenizer is not None
+        decode_fn = get_decode_html_safe_fn(self.model_list[0].tokenizer)
 
         # Create iterator
         iterator = list(self.feature_data_dict.items())

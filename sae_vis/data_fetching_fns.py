@@ -14,6 +14,8 @@ from torch import Tensor
 from tqdm.auto import tqdm
 from transformer_lens import HookedTransformer, utils
 
+from typing import List
+
 from sae_vis.data_config_classes import (
     SaeVisConfig,
     SaeVisLayoutConfig,
@@ -53,8 +55,7 @@ device = get_device()
 
 
 def compute_feat_acts(
-    model_A_acts: Float[Tensor, "batch seq d_in"],
-    model_B_acts: Float[Tensor, "batch seq d_in"],
+    model_act_list: List[Float[Tensor, "batch seq d_in"]],
     feature_idx: list[int],
     encoder: CrossCoder,
     encoder_B: CrossCoder | None = None,
@@ -84,8 +85,8 @@ def compute_feat_acts(
     """
     # Get the feature act direction by indexing encoder.W_enc, and the bias by indexing encoder.b_enc
     
-    model_acts = torch.stack([model_A_acts, model_B_acts], dim=0) # [n_layers, batch, seq, d_in]
-    model_acts = model_acts[:, :, 1:, :] # drop bos
+    model_acts = torch.stack(model_act_list, dim=0) # [n_layers, batch, seq, d_in]
+    # model_acts = model_acts[:, :, 1:, :] # drop bos
     
     feature_act_dir = encoder.W_enc[:, :, feature_idx]  # (n_layers, d_in, feats)
     feature_bias = encoder.b_enc[feature_idx]  # (feats,)
@@ -138,19 +139,19 @@ def compute_feat_acts(
 @torch.inference_mode()
 def parse_feature_data(
     tokens: Int[Tensor, "batch seq"],
+    attn: Int[Tensor, "batch seq"],
     feature_indices: int | list[int],
     all_feat_acts: Float[Tensor, "... feats"],
-    feature_resid_dir_A: Float[Tensor, "feats d_model"],
-    feature_resid_dir_B: Float[Tensor, "feats d_model"],
+    feature_resid_dir_list: List[Float[Tensor, "feats d_model"]],
     all_resid_post: Float[Tensor, "... d_model"],
-    W_U_A: Float[Tensor, "d_model d_vocab"],
-    W_U_B: Float[Tensor, "d_model d_vocab"],
+    W_U_list: List[Float[Tensor, "d_model d_vocab"]],
     cfg: SaeVisConfig,
     feature_out_dir: Float[Tensor, "feats d_out"] | None = None,
     corrcoef_neurons: RollingCorrCoef | None = None,
     corrcoef_encoder: RollingCorrCoef | None = None,
     corrcoef_encoder_B: RollingCorrCoef | None = None,
     progress: list[tqdm] | None = None,
+    encoder = None
 ) -> tuple[SaeVisData, dict[str, float]]:
     """Convert generic activation data into a SaeVisData object, which can be used to create the feature-centric vis.
 
@@ -161,6 +162,9 @@ def parse_feature_data(
     Args:
         tokens: Int[Tensor, "batch seq"]
             The tokens we'll be using to get the feature activations.
+            
+        attn: Int[Tensor, "batch seq"]
+            The attention mask for the tokens we'll be using to get the feature activations.
 
         feature_indices: Union[int, list[int]]
             The features we're actually computing. These might just be a subset of the model's full features.
@@ -168,14 +172,14 @@ def parse_feature_data(
         all_feat_acts: Float[Tensor, "... feats"]
             The activations values of the features across the batch & sequence.
 
-        feature_resid_dir_A: Float[Tensor, "feats d_model"]
+        feature_resid_dir_list: List[Float[Tensor, "feats d_model"]]
             The directions that each feature writes to the residual stream.
             For example, feature_resid_dir_A = encoder.W_dec[feature_indices] # [feats d_CrossCoder]
 
         all_resid_post: Float[Tensor, "... d_model"]
             The activations of the final layer of the model before the unembed.
 
-        W_U_A: Float[Tensor, "d_model d_vocab"]
+        W_U_list: List[Float[Tensor, "d_model d_vocab"]]
             The model's unembed weights for the logit lens.
 
         cfg: SaeVisConfig
@@ -222,13 +226,13 @@ def parse_feature_data(
         feature_indices = [feature_indices]
 
     assert (
-        feature_resid_dir_A.shape[0] == len(feature_indices)
-    ), f"Num features in feature_resid_dir_A ({feature_resid_dir_A.shape[0]}) doesn't match {len(feature_indices)=}"
+        feature_resid_dir_list[0].shape[0] == len(feature_indices)
+    ), f"Num features in feature_resid_dir_list[0] ({feature_resid_dir_list[0].shape[0]}) doesn't match {len(feature_indices)=}"
 
     if feature_out_dir is not None:
         assert (
             feature_out_dir.shape[0] == len(feature_indices)
-        ), f"Num features in feature_out_dir ({feature_resid_dir_A.shape[0]}) doesn't match {len(feature_indices)=}"
+        ), f"Num features in feature_out_dir ({feature_resid_dir_list[0].shape[0]}) doesn't match {len(feature_indices)=}"
 
     # ! Data setup code (defining the main objects we'll eventually return)
     feature_data_dict: dict[int, FeatureData] = {
@@ -266,23 +270,20 @@ def parse_feature_data(
             
         # Table 2?: relative decoder norm strength for crosscoders
         if layout.feature_tables_cfg.relative_decoder_strength_table: # TODO: update
-            # TODO: we should probably use exact decoder dir rather than resid dir, but should be fine for residual stream crosscoders
-            feature_resid_dir_A_norms = feature_resid_dir_A.norm(dim=-1, keepdim=True) # [feats 1]
-            feature_resid_dir_B_norms = feature_resid_dir_B.norm(dim=-1, keepdim=True) # [feats 1]
-            
-            relative_decoder_strength_base = feature_resid_dir_A_norms / (feature_resid_dir_A_norms + feature_resid_dir_B_norms) # [feats 1]
-            relative_decoder_strength_chat = feature_resid_dir_B_norms / (feature_resid_dir_A_norms + feature_resid_dir_B_norms) # [feats 1]
-
-            relative_decoder_strength = torch.cat([relative_decoder_strength_base, relative_decoder_strength_chat], dim=1) # [feats 2]
+            # W_dec = f_feats x models x model_dim
+            norms = encoder.W_dec.norm(dim=-1)
+            relative_decoder_strength_modelA = (norms[:, 0] / norms.sum(dim=-1))[feature_indices].unsqueeze(dim=1) # [feats 1]
+            relative_decoder_strength_modelB = (norms[:, 1] / norms.sum(dim=-1))[feature_indices].unsqueeze(dim=1) # [feats 1]
+            relative_decoder_strength = torch.cat([relative_decoder_strength_modelA, relative_decoder_strength_modelB], dim=1) # [feats 2]
             feature_tables_data.update(
-                relative_decoder_strength_indices=[["Base", "Chat"] for _ in range(len(feature_indices))], # TODO: maybe make this more general
+                relative_decoder_strength_indices=[["Model A", "Model B"] for _ in range(len(feature_indices))], # TODO: may need to scale to > 2 models
                 relative_decoder_strength_values=relative_decoder_strength.tolist(), # [feats 2]
             )
             
         # Table 3?: decoder cosine similarity between both models
         if layout.feature_tables_cfg.decoder_cosine_sim_table: # TODO: update
             # TODO: we should probably use exact decoder dir rather than resid dir, but should be fine for residual stream crosscoders
-            cosine_sims = F.cosine_similarity(feature_resid_dir_A, feature_resid_dir_B, dim=-1) # [feats]
+            cosine_sims = F.cosine_similarity(feature_resid_dir_list[0], feature_resid_dir_list[1], dim=-1) # [feats]
             if cosine_sims.dim() == 0:
                 cosine_sims = cosine_sims.unsqueeze(0)
                 
@@ -338,17 +339,16 @@ def parse_feature_data(
     # ! Get all data for the middle column visualisations, i.e. the two histograms & the logit table
 
     # Get the logits of all features (i.e. the directions this feature writes to the logit output)
-    logits_A = einops.einsum(
-        feature_resid_dir_A, W_U_A, "feats d_model, d_model d_vocab -> feats d_vocab"
-    )
-    logits_B = einops.einsum(
-        feature_resid_dir_B, W_U_B, "feats d_model, d_model d_vocab -> feats d_vocab"
-    )
+    logits = []
+    for resid_dir, W_U in zip(feature_resid_dir_list, W_U_list):
+        logits.append(einops.einsum(
+            resid_dir, W_U, "feats d_model, d_model d_vocab -> feats d_vocab"
+        ))
     if any(
         x is not None
         for x in [layout.act_hist_cfg, layout.logits_hist_cfg, layout.logits_table_cfg_A, layout.logits_table_cfg_B]
     ):
-        for i, (feat, logit_vector_A, logit_vector_B) in enumerate(zip(feature_indices, logits_A, logits_B)):
+        for i, (feat, logit_vector_A, logit_vector_B) in enumerate(zip(feature_indices, logits[0], logits[1])):
             # Get logits histogram data (no title)
             if layout.logits_hist_cfg is not None:
                 feature_data_dict[
@@ -363,8 +363,15 @@ def parse_feature_data(
             # Get data for feature activations histogram (including the title!)
             if layout.act_hist_cfg is not None:
                 feat_acts = all_feat_acts[..., i]
-                nonzero_feat_acts = feat_acts[feat_acts > 0]
-                frac_nonzero = nonzero_feat_acts.numel() / feat_acts.numel()
+                feat_mask = attn.bool() #[:, 1:] # drop bos
+                feat_acts_masked = feat_acts[feat_mask]
+                nonzero_feat_acts = feat_acts_masked[feat_acts_masked > 0]
+                if feat_acts_masked.numel() == 0:
+                    frac_nonzero = 0.0
+                    print("No nonzero activations found for this feature in this batch?")
+                else:
+                    frac_nonzero = nonzero_feat_acts.numel() / feat_acts_masked.numel()
+                
                 feature_data_dict[
                     feat
                 ].acts_histogram_data = ActsHistogramData.from_data(
@@ -432,15 +439,19 @@ def parse_feature_data(
     # ! Calculate all data for the right-hand visualisations, i.e. the sequences
 
     if layout.seq_cfg is not None:
+        # print("_________________________")
+        # print("seq_cfg")
+        # print(layout.seq_cfg)
         for i, feat in enumerate(feature_indices):
             # Add this feature's sequence data to the list
             feature_data_dict[feat].sequence_data = get_sequences_data(
                 tokens=tokens,
+                attn=attn,
                 feat_acts=all_feat_acts[..., i],
-                feat_logits=logits_A[i],
+                feat_logits=logits[0][i],
                 resid_post=all_resid_post,
-                feature_resid_dir=feature_resid_dir_A[i],
-                W_U=W_U_A,
+                feature_resid_dir=feature_resid_dir_list[0][i],
+                W_U=W_U_list[0],
                 seq_cfg=layout.seq_cfg,
             )
             # Update the 2nd progress bar (fwd passes & getting sequence data dominates the runtime of these computations)
@@ -466,9 +477,9 @@ def parse_feature_data(
 def _get_feature_data(
     encoder: CrossCoder,
     encoder_B: CrossCoder | None,
-    model_A: TransformerLensWrapper,
-    model_B: TransformerLensWrapper,
+    wrapped_model_list: List[TransformerLensWrapper],
     tokens: Int[Tensor, "batch seq"],
+    attn: Int[Tensor, "batch seq"],
     feature_indices: int | list[int],
     cfg: SaeVisConfig,
     progress: list[tqdm] | None = None,
@@ -493,6 +504,9 @@ def _get_feature_data(
 
         tokens: Int[Tensor, "batch seq"]
             The tokens we'll be using to get the feature activations.
+            
+        attn: Int[Tensor, "batch seq"]
+            The attention of the tokens in case they are padded.
 
         feature_indices: Union[int, list[int]]
             The features we're actually computing. These might just be a subset of the model's full features.
@@ -538,22 +552,23 @@ def _get_feature_data(
     # ! Data setup code (defining the main objects we'll eventually return, for each of 5 possible vis components)
 
     # Create lists to store the feature activations & final values of the residual stream
-    all_resid_post_A = []
-    all_resid_post_B = []
+    all_resid_post = [[] for model_idx in range(len(wrapped_model_list))]
     all_feat_acts = []
 
     # Create objects to store the data for computing rolling stats
-    corrcoef_neurons = RollingCorrCoef()
-    corrcoef_encoder = RollingCorrCoef(indices=feature_indices, with_self=True)
-    corrcoef_encoder_B = RollingCorrCoef() if encoder_B is not None else None
+    # corrcoef_neurons = RollingCorrCoef()
+    # corrcoef_encoder = RollingCorrCoef(indices=feature_indices, with_self=True)
+    # corrcoef_encoder_B = RollingCorrCoef() if encoder_B is not None else None
 
     # Get encoder & decoder directions
-    feature_out_dir_A = encoder.W_dec[feature_indices, 0]  # [feats d_CrossCoder]
-    feature_resid_dir_A = to_resid_dir(feature_out_dir_A, model_A)  # [feats d_model]
-
-    feature_out_dir_B = encoder.W_dec[feature_indices, 1]  # [feats d_CrossCoder]
-    feature_resid_dir_B = to_resid_dir(feature_out_dir_B, model_B)  # [feats d_model]
-
+    feat_out_dirs = []
+    feat_resid_dirs = []
+    for model_idx, model in enumerate(wrapped_model_list):
+        feature_out_dir = encoder.W_dec[feature_indices, model_idx]  # [feats d_CrossCoder]
+        feat_out_dirs.append(feature_out_dir)
+        feature_resid_dir = to_resid_dir(feature_out_dir, model)  # [feats d_model]
+        feat_resid_dirs.append(feature_resid_dir)
+    
     time_logs["(1) Initialization"] = time.time() - t0
 
     # ! Compute & concatenate together all feature activations & post-activation function values
@@ -561,15 +576,19 @@ def _get_feature_data(
     for minibatch in token_minibatches:
         # Fwd pass, get model activations
         t0 = time.time()
-        residual_A, model_A_acts = model_A.forward(minibatch, return_logits=False)
-        residual_B, model_B_acts = model_B.forward(minibatch, return_logits=False)
+        res_list = []
+        act_list = []
+        for model_idx, model in enumerate(wrapped_model_list):
+            residual, model_acts = model.forward(minibatch, return_logits=False)
+            res_list.append(residual)
+            act_list.append(model_acts)
+        
         time_logs["(2) Forward passes to gather model activations"] += time.time() - t0
 
         # Compute feature activations from this
         t0 = time.time()
         feat_acts = compute_feat_acts(
-            model_A_acts=model_A_acts,
-            model_B_acts=model_B_acts,
+            model_act_list=act_list,
             feature_idx=feature_indices,
             encoder=encoder,
             encoder_B=encoder_B,
@@ -581,33 +600,34 @@ def _get_feature_data(
 
         # Add these to the lists (we'll eventually concat)
         all_feat_acts.append(feat_acts)
-        all_resid_post_A.append(residual_A) # TODO: Idk what this is used for
-        all_resid_post_B.append(residual_B)
+        for model_idx in range(len(wrapped_model_list)):
+            all_resid_post[model_idx].append(res_list[model_idx])
         
         # Update the 1st progress bar (fwd passes & getting sequence data dominates the runtime of these computations)
         if progress is not None:
             progress[0].update(1)
 
     all_feat_acts = torch.cat(all_feat_acts, dim=0)
-    all_resid_post_A = torch.cat(all_resid_post_A, dim=0)
-    all_resid_post_B = torch.cat(all_resid_post_B, dim=0)
-
+    
+    for model_idx in range(len(wrapped_model_list)):
+        all_resid_post[model_idx] = torch.cat(all_resid_post[model_idx], dim=0)
+    
     # ! Use the data we've collected to make a MultiFeatureData object
     sae_vis_data, _time_logs = parse_feature_data(
         tokens=tokens,
+        attn=attn,
         feature_indices=feature_indices,
         all_feat_acts=all_feat_acts,
-        feature_resid_dir_A=feature_resid_dir_A,
-        feature_resid_dir_B=feature_resid_dir_B,
-        all_resid_post=all_resid_post_A,
-        W_U_A=model_A.W_U,
-        W_U_B=model_B.W_U,
+        feature_resid_dir_list=feat_resid_dirs,
+        all_resid_post=all_resid_post[0], # NOTE: used to be all_resid_post_A
+        W_U_list=[model.W_U for model in wrapped_model_list], 
         cfg=cfg,
-        feature_out_dir=feature_out_dir_A,
+        feature_out_dir=feat_out_dirs[0], # NOTE:,used to be feature_out_dir_A
         # corrcoef_neurons=corrcoef_neurons,
         # corrcoef_encoder=corrcoef_encoder,
         # corrcoef_encoder_B=corrcoef_encoder_B,
         progress=progress,
+        encoder=encoder
     )
 
     assert (
@@ -618,13 +638,13 @@ def _get_feature_data(
 
     return sae_vis_data, time_logs
 
-
+from nnsight import LanguageModel
 @torch.inference_mode()
 def get_feature_data(
     encoder: CrossCoder,
-    model_A: HookedTransformer,
-    model_B: HookedTransformer,
+    model_list: List[LanguageModel],
     tokens: Int[Tensor, "batch seq"],
+    attn: Int[Tensor, "batch seq"],
     cfg: SaeVisConfig,
     encoder_B: CrossCoder | None = None,
 ) -> SaeVisData:
@@ -681,25 +701,14 @@ def get_feature_data(
 
     # If the model is from TransformerLens, we need to apply a wrapper to it for standardization
     assert isinstance(
-        model_A, HookedTransformer
-    ), "Error: non-HookedTransformer models are not yet supported."
-    assert isinstance(
         cfg.hook_point, str
     ), f"Error: cfg.hook_point must be a string, got {cfg.hook_point}"
-    model_A_wrapper = TransformerLensWrapper(model_A, cfg.hook_point)
-    
-    assert isinstance(
-        model_B, HookedTransformer
-    ), "Error: non-HookedTransformer models are not yet supported."
-    assert isinstance(
-        cfg.hook_point, str
-    ), f"Error: cfg.hook_point must be a string, got {cfg.hook_point}"
-    model_B_wrapper = TransformerLensWrapper(model_B, cfg.hook_point)
+    wrapped_model_list = [TransformerLensWrapper(model, cfg) for model in model_list]
 
     # For each batch of features: get new data and update global data storage objects
     for features in feature_batches:
         new_feature_data, new_time_logs = _get_feature_data(
-            encoder, encoder_B, model_A_wrapper, model_B_wrapper, tokens, features, cfg, progress
+            encoder, encoder_B, wrapped_model_list, tokens, attn, features, cfg, progress
         )
         sae_vis_data.update(new_feature_data)
         for key, value in new_time_logs.items():
@@ -724,6 +733,7 @@ def get_feature_data(
 @torch.inference_mode()
 def get_sequences_data(
     tokens: Int[Tensor, "batch seq"],
+    attn: Int[Tensor, "batch seq"],
     feat_acts: Float[Tensor, "batch seq"],
     feat_logits: Float[Tensor, "d_vocab"],
     resid_post: Float[Tensor, "batch seq d_model"],
@@ -783,18 +793,21 @@ def get_sequences_data(
     )
 
     # Get the top-activating tokens
-    indices = k_largest_indices(feat_acts, k=seq_cfg.top_acts_group_size, buffer=buffer)
-    indices_dict = {f"TOP ACTIVATIONS<br>MAX = {feat_acts.max():.3f}": indices}
+    feat_mask = attn.bool() #[:, 1:] # drop bos
+    masked_feat_acts = feat_acts.masked_fill(feat_mask == 0, float('-inf'))
+    indices = k_largest_indices(masked_feat_acts, k=seq_cfg.top_acts_group_size, buffer=buffer)
+    indices_dict = {f"TOP ACTIVATIONS<br>MAX = {masked_feat_acts.max():.3f}": indices}
 
     # Get all possible indices. Note, we need to be able to look 1 back (feature activation on prev token is needed for
     # computing loss effect on this token)
     if seq_cfg.n_quantiles > 0:
-        quantiles = torch.linspace(0, feat_acts.max().item(), seq_cfg.n_quantiles + 1)
+        quantiles = torch.linspace(0, feat_acts[feat_mask].max().item(), seq_cfg.n_quantiles + 1)
         for i in range(seq_cfg.n_quantiles - 1, -1, -1):
             lower, upper = quantiles[i : i + 2].tolist()
-            pct = ((feat_acts >= lower) & (feat_acts <= upper)).float().mean()
+            mask_bounds = (masked_feat_acts >= lower) & (masked_feat_acts <= upper)
+            pct = mask_bounds.float().mean()
             indices = random_range_indices(
-                feat_acts,
+                masked_feat_acts,
                 k=seq_cfg.quantile_group_size,
                 bounds=(lower, upper),
                 buffer=buffer,
@@ -841,6 +854,12 @@ def get_sequences_data(
     assert indices_buf.shape == (n_bold, padded_buffer_width, 2)
 
     # ! (3) Extract the token IDs, feature activations & residual stream values for those positions
+    
+    # Create mask from attention
+    batch_indices = indices_buf[..., 0].long()
+    seq_indices = indices_buf[..., 1].long()
+    valid_mask = attn[batch_indices, seq_indices].bool()
+    valid_mask = valid_mask[:, 1:]
 
     # Get the tokens which will be in our sequences
     token_ids = eindex(
@@ -900,17 +919,18 @@ def get_sequences_data(
     # ! (4A) Use this to compute the most affected tokens by this feature
     # The TopK function can improve efficiency by masking the features which are zero
     acts_nonzero = feat_acts_pre_ablation.abs() > 1e-5  # shape [batch buf]
+    assert acts_nonzero.shape == valid_mask.shape, "Shape mismatch in TopK masking!"
     top_contribution_to_logits = TopK(
         contribution_to_logprobs,
         k=seq_cfg.top_logits_hoverdata,
         largest=True,
-        tensor_mask=acts_nonzero,
+        tensor_mask=acts_nonzero & valid_mask,
     )
     bottom_contribution_to_logits = TopK(
         contribution_to_logprobs,
         k=seq_cfg.top_logits_hoverdata,
         largest=False,
-        tensor_mask=acts_nonzero,
+        tensor_mask=acts_nonzero & valid_mask,
     )
 
     # ! (4B) Use this to compute the loss effect if this feature is ablated
@@ -918,6 +938,7 @@ def get_sequences_data(
     loss_contribution = eindex(
         -contribution_to_logprobs, correct_tokens, "batch seq [batch seq]"
     )
+    loss_contribution[~valid_mask] = 0.0
 
     # ! (5) Store the results in a SequenceMultiGroupData object
 
@@ -927,21 +948,19 @@ def get_sequences_data(
         [0] + [len(indices) for indices in indices_dict.values()]
     ).tolist()
     for group_idx, group_name in enumerate(indices_dict.keys()):
-        seq_data = [
-            SequenceData(
-                token_ids=token_ids[i].tolist(),
-                feat_acts=[round(f, 4) for f in feat_acts_coloring[i].tolist()],
-                loss_contribution=loss_contribution[i].tolist(),
-                token_logits=feat_logits[token_ids[i]].tolist(),
-                top_token_ids=top_contribution_to_logits.indices[i].tolist(),
-                top_logits=top_contribution_to_logits.values[i].tolist(),
-                bottom_token_ids=bottom_contribution_to_logits.indices[i].tolist(),
-                bottom_logits=bottom_contribution_to_logits.values[i].tolist(),
-            )
-            for i in range(
-                group_sizes_cumsum[group_idx], group_sizes_cumsum[group_idx + 1]
-            )
-        ]
+        seq_data = []
+        for i in range(group_sizes_cumsum[group_idx], group_sizes_cumsum[group_idx + 1]):
+            L = valid_mask[i].sum().item()
+            seq_data.append(SequenceData(
+                token_ids=token_ids[i, :L].tolist(),
+                feat_acts=[round(f, 4) for f in feat_acts_coloring[i, :L].tolist()],
+                loss_contribution=loss_contribution[i, :L].tolist(),
+                token_logits=feat_logits[token_ids[i, :L]].tolist(),
+                top_token_ids=top_contribution_to_logits.indices[i, :L].tolist(),
+                top_logits=top_contribution_to_logits.values[i, :L].tolist(),
+                bottom_token_ids=bottom_contribution_to_logits.indices[i, :L].tolist(),
+                bottom_logits=bottom_contribution_to_logits.values[i, :L].tolist(),
+            ))
         sequence_groups_data.append(SequenceGroupData(group_name, seq_data))
 
     return SequenceMultiGroupData(sequence_groups_data)
