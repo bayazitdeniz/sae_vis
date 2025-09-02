@@ -95,7 +95,7 @@ class CrossCoder(nn.Module):
         return self.decode(acts)
     
     @classmethod
-    def load(cls, version_dir, checkpoint_version, path="./workspace/crosscoder-pythia/checkpoints", verbose=True):
+    def load(cls, version_dir, checkpoint_version, path="./workspace/logs/checkpoints", verbose=True):
         # TODO: fix base dir naming to be model agnostic
         #       for now keep it this way because 
         #       the path is hardcoded in the analysis
